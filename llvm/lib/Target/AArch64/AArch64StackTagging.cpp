@@ -15,6 +15,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/Support/MD5.h"
 #include "llvm/ADT/None.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallVector.h"
@@ -71,6 +72,13 @@ static cl::opt<bool>
              cl::ZeroOrMore,
              cl::desc("backwards compatible stack tagging: generate code "
                       "that runs on older hardware"));
+
+static cl::opt<int> ClBisectStart("stack-tagging-bisect-start",
+                                     cl::init(-1), cl::Hidden);
+static cl::opt<int> ClBisectEnd("stack-tagging-bisect-end",
+                                     cl::init(-1), cl::Hidden);
+static cl::opt<bool> ClBisectDump("stack-tagging-bisect-dump",
+                                     cl::init(false), cl::Hidden);
 
 static const Align kTagGranuleSize = Align(16);
 
@@ -822,6 +830,14 @@ bool AArch64StackTagging::runOnFunction(Function &Fn) {
     AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
 
   // F->dump();
+  StringRef Name = F->getName();
+  int Hash = llvm::MD5Hash(Name) % 1000000;
+  if (ClBisectStart >= 0 && Hash < ClBisectStart)
+    return false;
+  if (ClBisectEnd >= 0 && Hash >= ClBisectEnd)
+    return false;
+  if (ClBisectDump)
+    errs() << "ZZZ instrumenting: " << Name << "\n";
 
   MapVector<AllocaInst *, AllocaInfo> Allocas; // need stable iteration order
   SmallVector<Instruction *, 8> RetVec;
