@@ -67,6 +67,12 @@ class AArch64StackTaggingPreRA : public MachineFunctionPass {
 
   SmallVector<MachineInstr*, 16> ReTags;
 
+  struct ConditionalTagInfo {
+    MachineInstr *PHI;
+    int FI;
+  };
+  SmallVector<ConditionalTagInfo, 16> ConditionalTags;
+
 public:
   static char ID;
   AArch64StackTaggingPreRA() : MachineFunctionPass(ID) {
@@ -77,6 +83,7 @@ public:
   void uncheckUsesOf(unsigned TaggedReg, int FI);
   void uncheckLoadsAndStores();
   Optional<int> findFirstSlotCandidate();
+  Optional<int> isConditionalTagInstruction(MachineInstr *CondMI);
 
   bool runOnMachineFunction(MachineFunction &Func) override;
   StringRef getPassName() const override {
@@ -200,6 +207,11 @@ void AArch64StackTaggingPreRA::uncheckLoadsAndStores() {
     unsigned TaggedReg = I->getOperand(0).getReg();
     int FI = I->getOperand(1).getIndex();
     uncheckUsesOf(TaggedReg, FI);
+  }
+
+  for (auto &P : ConditionalTags) {
+    unsigned MaybeTaggedReg = P.PHI->getOperand(0).getReg();
+    uncheckUsesOf(MaybeTaggedReg, P.FI);
   }
 }
 
@@ -338,6 +350,37 @@ Optional<int> AArch64StackTaggingPreRA::findFirstSlotCandidate() {
   return MaxScoreST.FI;
 }
 
+Optional<int> AArch64StackTaggingPreRA::isConditionalTagInstruction(MachineInstr *CondMI) {
+  Optional<int> SingleFI;
+
+  if (!CondMI->isPHI())
+    return None;
+
+  for (unsigned i = 1; i != CondMI->getNumOperands(); i += 2) {
+    Register Reg = CondMI->getOperand(i).getReg();
+    do {
+      MachineInstr *MI = MRI->getVRegDef(Reg);
+      if (MI->isFullCopy() || MI->getOpcode() == AArch64::IRG) {
+        Reg = MI->getOperand(1).getReg();
+        if (!Register::isVirtualRegister(Reg))
+          return None;
+        continue;
+      }
+      if (MI->getOpcode() == AArch64::ADDXri && MI->getOperand(1).isFI() &&
+          MI->getOperand(2).isImm() && MI->getOperand(2).getImm() == 0 &&
+          MI->getOperand(3).isImm() && MI->getOperand(3).getImm() == 0) {
+        int FI = MI->getOperand(1).getIndex();
+        if (SingleFI && *SingleFI != FI)
+          return None;
+        SingleFI = FI;
+        break;
+      }
+      return None;
+    } while (true);
+  }
+  return SingleFI;
+}
+
 bool AArch64StackTaggingPreRA::runOnMachineFunction(MachineFunction &Func) {
   MF = &Func;
   MRI = &MF->getRegInfo();
@@ -347,6 +390,7 @@ bool AArch64StackTaggingPreRA::runOnMachineFunction(MachineFunction &Func) {
       MF->getSubtarget().getRegisterInfo());
   MFI = &MF->getFrameInfo();
   ReTags.clear();
+  ConditionalTags.clear();
 
   assert(MRI->isSSA());
 
@@ -362,7 +406,11 @@ bool AArch64StackTaggingPreRA::runOnMachineFunction(MachineFunction &Func) {
         TaggedSlots.insert(FI);
         // There should be no offsets in TAGP yet.
         assert(I.getOperand(2).getImm() == 0);
+        continue;
       }
+      Optional<int> MaybeFI = isConditionalTagInstruction(&I);
+      if (MaybeFI)
+        ConditionalTags.push_back({&I, *MaybeFI});
     }
   }
 
@@ -371,11 +419,14 @@ bool AArch64StackTaggingPreRA::runOnMachineFunction(MachineFunction &Func) {
   for (int FI : TaggedSlots)
     MFI->setObjectSSPLayout(FI, MachineFrameInfo::SSPLK_None);
 
-  if (ReTags.empty())
+  if (ReTags.empty() && ConditionalTags.empty())
     return false;
 
   if (mayUseUncheckedLoadStore())
     uncheckLoadsAndStores();
+
+  if (ReTags.empty())
+    return true;
 
   // Find a slot that is used with zero tag offset, like ADDG #fi, 0.
   // If the base tagged pointer is set up to the address of this slot,
